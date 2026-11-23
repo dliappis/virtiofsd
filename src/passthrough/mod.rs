@@ -241,18 +241,24 @@ trait AclModeFile {
     fn set_acl(&self, value: &[u8]) -> io::Result<()>;
     /// Must succeed if there is no ACL.
     fn remove_acl(&self) -> io::Result<()>;
+    /// Removes file capabilities, like the kernel does when an xattr is set.
+    fn clear_capabilities(&self) -> io::Result<()>;
 }
 
 /// Changes a remapped access ACL and the mode of `file` together.  `plan` is given the current
-/// ACL and mode, and returns how to change the ACL and the new mode.  If any step fails, the ACL
-/// and the mode are restored.
+/// ACL and mode, and returns how to change the ACL and the new mode.  If `clear_caps`, file
+/// capabilities are removed once `plan` has accepted the request.
 ///
 /// An unprivileged daemon needs read and write permission for `user.*` xattrs even as the owner.
-/// If the host denies an xattr step with `EACCES`, the owner gets them until the final chmod.  The
-/// host offers no way to change an xattr and the mode atomically, so if the daemon dies between
-/// the steps, that permission or a mismatched ACL can remain.
+/// If the host denies an xattr step with `EACCES`, the owner gets them until the final chmod.
+///
+/// If a step fails, the ACL and the mode are restored on a best-effort basis: a failing restore is
+/// logged, and removed file capabilities are not restored.  The host offers no way to change an
+/// xattr and the mode atomically, so if the daemon dies between the steps, the temporary
+/// permission or a mismatched ACL can remain.
 fn update_acl_and_mode(
     file: &impl AclModeFile,
+    clear_caps: bool,
     plan: impl FnOnce(Option<&[u8]>, libc::mode_t) -> io::Result<(AclUpdate, libc::mode_t)>,
 ) -> io::Result<()> {
     let is_eacces = |e: &io::Error| e.raw_os_error() == Some(libc::EACCES);
@@ -261,7 +267,9 @@ fn update_acl_and_mode(
     let mut widened = false;
     let restore_mode = |widened: bool| {
         if widened {
-            let _ = file.chmod(orig_mode);
+            if let Err(e) = file.chmod(orig_mode) {
+                error!("Failed to restore mode {orig_mode:o} after a failed ACL update: {e}");
+            }
         }
     };
 
@@ -282,10 +290,15 @@ fn update_acl_and_mode(
         update => update,
     };
 
-    let apply = || match &update {
-        AclUpdate::Keep => Ok(()),
-        AclUpdate::Set(value) => file.set_acl(value),
-        AclUpdate::Remove => file.remove_acl(),
+    let apply = || {
+        if clear_caps {
+            file.clear_capabilities()?;
+        }
+        match &update {
+            AclUpdate::Keep => Ok(()),
+            AclUpdate::Set(value) => file.set_acl(value),
+            AclUpdate::Remove => file.remove_acl(),
+        }
     };
     let res = match apply() {
         Err(e) if is_eacces(&e) && !widened && owner_rw != orig_mode => {
@@ -302,10 +315,13 @@ fn update_acl_and_mode(
 
     file.chmod(new_mode).inspect_err(|_| {
         if update != AclUpdate::Keep {
-            let _ = match &old {
+            let res = match &old {
                 Some(value) => file.set_acl(value),
                 None => file.remove_acl(),
             };
+            if let Err(e) = res {
+                error!("Failed to restore the ACL after a failed chmod: {e}");
+            }
         }
         restore_mode(widened);
     })
@@ -2662,9 +2678,10 @@ impl FileSystem for PassthroughFs {
                 let file = HostAclFile {
                     fs: self,
                     file: &inode_file,
+                    file_type,
                     name: acl_xattr,
                 };
-                update_acl_and_mode(&file, |acl, _| {
+                update_acl_and_mode(&file, false, |acl, _| {
                     let update = match acl.and_then(|acl| posix_acl_chmod(acl, attr.mode)) {
                         Some(acl) => AclUpdate::Set(acl),
                         None => AclUpdate::Keep,
@@ -3153,18 +3170,14 @@ impl FileSystem for PassthroughFs {
             let kill_sgid = extra_flags.contains(SetxattrFlags::SETXATTR_ACL_KILL_SGID);
             let _acl_guard = self.acl_sync.lock().unwrap();
             let inode_file = data.get_file()?;
-            self.clear_file_capabilities(
-                inode_file.as_raw_fd(),
-                FileType::from_mode(data.mode),
-                true,
-            )?;
             let file = HostAclFile {
                 fs: self,
                 file: &inode_file,
+                file_type: FileType::from_mode(data.mode),
                 name: acl_xattr,
             };
             // Like `posix_acl_update_mode()`, an ACL the mode fully describes is not stored.
-            return update_acl_and_mode(&file, |acl, mode| {
+            return update_acl_and_mode(&file, true, |acl, mode| {
                 if flags & libc::XATTR_CREATE as u32 != 0 && acl.is_some() {
                     return Err(io::Error::from_raw_os_error(libc::EEXIST));
                 }
@@ -3373,10 +3386,24 @@ impl FileSystem for PassthroughFs {
 
         let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let name = self.map_client_xattrname(name)?;
-        let _acl_guard = self
+        if let Some(acl_xattr) = self
             .remapped_acl_xattr(&data)
             .filter(|acl_xattr| name.as_ref() == *acl_xattr)
-            .map(|_| self.acl_sync.lock().unwrap());
+        {
+            let _acl_guard = self.acl_sync.lock().unwrap();
+            let inode_file = data.get_file()?;
+            let file = HostAclFile {
+                fs: self,
+                file: &inode_file,
+                file_type: FileType::from_mode(data.mode),
+                name: acl_xattr,
+            };
+            // Removing an access ACL leaves the mode as it is.
+            return update_acl_and_mode(&file, false, |acl, mode| match acl {
+                Some(_) => Ok((AclUpdate::Remove, mode)),
+                None => Err(io::Error::from_raw_os_error(libc::ENODATA)),
+            });
+        }
 
         let res = if is_safe_inode(data.mode) {
             // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
@@ -3534,6 +3561,7 @@ impl From<GuestFile> for HandleDataFile {
 struct HostAclFile<'a, F: AsRawFd> {
     fs: &'a PassthroughFs,
     file: &'a F,
+    file_type: FileType,
     name: &'a CStr,
 }
 
@@ -3556,6 +3584,11 @@ impl<F: AsRawFd> AclModeFile for HostAclFile<'_, F> {
 
     fn remove_acl(&self) -> io::Result<()> {
         self.fs.remove_xattr(self.file, self.name)
+    }
+
+    fn clear_capabilities(&self) -> io::Result<()> {
+        self.fs
+            .clear_file_capabilities(self.file.as_raw_fd(), self.file_type, true)
     }
 }
 
@@ -3702,6 +3735,10 @@ mod tests {
             *self.acl.borrow_mut() = None;
             Ok(())
         }
+
+        fn clear_capabilities(&self) -> io::Result<()> {
+            self.call(libc::S_IWUSR)
+        }
     }
 
     fn named_acl(user: u16, mask: u16) -> Vec<u8> {
@@ -3763,6 +3800,19 @@ mod tests {
             // chmod 0000, and back to 0644, of a file without an ACL
             (0o644, None, || Box::new(chmod_plan(0o000)), 0o000, None),
             (0o000, None, || Box::new(chmod_plan(0o644)), 0o644, None),
+            // removexattr of a named-user ACL on a 0400 file
+            (
+                0o400,
+                Some(named_acl(4, 0)),
+                || {
+                    Box::new(|acl: Option<&[u8]>, mode| {
+                        assert!(acl.is_some());
+                        Ok((AclUpdate::Remove, mode))
+                    })
+                },
+                0o400,
+                None,
+            ),
             // a named-user ACL on a 0400 file
             (
                 0o400,
@@ -3802,7 +3852,7 @@ mod tests {
                 acl_mode_cases().into_iter().enumerate()
             {
                 let file = FakeAclFile::new(mode, acl, unprivileged);
-                update_acl_and_mode(&file, plan()).unwrap();
+                update_acl_and_mode(&file, true, plan()).unwrap();
                 assert_eq!(
                     file.state(),
                     (want_mode, want_acl),
@@ -3817,11 +3867,11 @@ mod tests {
         for unprivileged in [false, true] {
             for (i, (mode, acl, plan, _, _)) in acl_mode_cases().into_iter().enumerate() {
                 let file = FakeAclFile::new(mode, acl.clone(), unprivileged);
-                update_acl_and_mode(&file, plan()).unwrap();
+                update_acl_and_mode(&file, true, plan()).unwrap();
                 for fail_at in 1..=file.calls.get() {
                     let mut file = FakeAclFile::new(mode, acl.clone(), unprivileged);
                     file.fail_at = Some(fail_at);
-                    assert!(update_acl_and_mode(&file, plan()).is_err());
+                    assert!(update_acl_and_mode(&file, true, plan()).is_err());
                     assert_eq!(
                         file.state(),
                         (mode, acl.clone()),
@@ -3937,6 +3987,174 @@ mod tests {
         assert_eq!(fallback_entry_mode(dir | 0o775, 0o2775, false), 0o2775);
         assert_eq!(fallback_entry_mode(dir | 0o6775, 0o775, false), 0o775);
         assert_eq!(fallback_entry_mode(dir | 0o1777, 0o775, false), 0o1777);
+    }
+
+    /// Exercises the remapped ACL handlers on the host filesystem holding the temporary
+    /// directory, which must support `user.` xattrs, as an unprivileged owner without
+    /// capabilities.  Run as root, it reruns itself as uid and gid 1000.
+    #[test]
+    fn remapped_acl_unprivileged_end_to_end() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::process::CommandExt;
+
+        const NAME: &str = "passthrough::tests::remapped_acl_unprivileged_end_to_end";
+        // Safe because this is always successful.
+        if unsafe { libc::geteuid() } == 0 {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", NAME, "--test-threads=1", "--nocapture"])
+                .uid(1000)
+                .gid(1000);
+            assert!(cmd.status().unwrap().success());
+            return;
+        }
+
+        let cstr = |s: &str| CString::new(s).unwrap();
+        let acl_name = cstr("system.posix_acl_access");
+        // Safe because these are always successful.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let ctx = || Context {
+            uid: GuestUid::from(uid),
+            gid: GuestGid::from(gid),
+            pid: 0,
+        };
+
+        for (i, &(xattrmap, maps_caps)) in [
+            (":map::user.virtiofs.:", true),
+            (
+                ":unsupported:client:security.capability:::map::user.virtiofs.:",
+                false,
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let root = std::env::temp_dir()
+                .join(format!("virtiofsd-acl-unpriv-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir(&root).unwrap();
+            let fs = PassthroughFs::new(Config {
+                root_dir: root.to_str().unwrap().to_string(),
+                xattr: true,
+                posix_acl: NegotiationMode::Always,
+                xattrmap: Some(XattrMap::try_from(xattrmap).unwrap()),
+                ..Default::default()
+            })
+            .unwrap();
+            fs.init(FsOptions::POSIX_ACL | FsOptions::DONT_MASK | FsOptions::SETXATTR_EXT)
+                .unwrap();
+
+            let host_path =
+                |name: &str| CString::new(root.join(name).as_os_str().as_bytes()).unwrap();
+            let host_mode =
+                |name: &str| std::fs::metadata(root.join(name)).unwrap().mode() & 0o7777;
+            let host_xattr = |name: &str, xattr: &str| {
+                let mut buf = vec![0u8; 256];
+                // Safe because this writes at most `buf.len()` bytes to `buf`.
+                let res = unsafe {
+                    libc::getxattr(
+                        host_path(name).as_ptr(),
+                        cstr(xattr).as_ptr(),
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                    )
+                };
+                (res >= 0).then(|| {
+                    buf.truncate(res as usize);
+                    buf
+                })
+            };
+            let host_acl = |name: &str| host_xattr(name, "user.virtiofs.system.posix_acl_access");
+            let new_file = |name: &str, mode| {
+                std::fs::write(root.join(name), b"x").unwrap();
+                std::fs::set_permissions(root.join(name), PermissionsExt::from_mode(mode)).unwrap();
+                fs.lookup(ctx(), fuse::ROOT_ID, &cstr(name)).unwrap().inode
+            };
+            let setacl = |inode, value: &[u8]| {
+                fs.setxattr(ctx(), inode, &acl_name, value, 0, SetxattrFlags::empty())
+            };
+            let chmod = |inode, mode| {
+                let attr = fuse::SetattrIn {
+                    mode,
+                    ..Default::default()
+                };
+                fs.setattr(ctx(), inode, attr, None, SetattrValid::MODE)
+                    .map(|_| ())
+            };
+
+            // A named ACL on a 0400 file.
+            let inode = new_file("named", 0o400);
+            setacl(inode, &named_acl(4, 4)).unwrap();
+            assert_eq!(host_mode("named"), 0o440, "{xattrmap}");
+            assert_eq!(host_acl("named"), Some(named_acl(4, 4)), "{xattrmap}");
+
+            // Back to 0400, then remove the ACL.
+            chmod(inode, 0o400).unwrap();
+            assert_eq!(host_acl("named"), Some(named_acl(4, 0)), "{xattrmap}");
+            fs.removexattr(ctx(), inode, &acl_name).unwrap();
+            assert_eq!(
+                (host_mode("named"), host_acl("named")),
+                (0o400, None),
+                "{xattrmap}"
+            );
+
+            // A minimal ACL on a 0400 file.
+            let inode = new_file("minimal", 0o400);
+            let minimal = acl(&[
+                (ACL_USER_OBJ, 4, u32::MAX),
+                (ACL_GROUP_OBJ, 0, u32::MAX),
+                (ACL_OTHER, 0, u32::MAX),
+            ]);
+            setacl(inode, &minimal).unwrap();
+            assert_eq!(
+                (host_mode("minimal"), host_acl("minimal")),
+                (0o400, None),
+                "{xattrmap}"
+            );
+
+            // chmod 0000 and back.
+            let inode = new_file("plain", 0o644);
+            chmod(inode, 0o000).unwrap();
+            assert_eq!(host_mode("plain"), 0o000, "{xattrmap}");
+            chmod(inode, 0o644).unwrap();
+            assert_eq!(
+                (host_mode("plain"), host_acl("plain")),
+                (0o644, None),
+                "{xattrmap}"
+            );
+
+            // Setting an ACL on a 0400 file clears its (remapped) file capabilities.
+            if maps_caps {
+                let path = host_path("caps");
+                std::fs::write(root.join("caps"), b"x").unwrap();
+                let cap_name = cstr("user.virtiofs.security.capability");
+                // Safe because this doesn't modify any memory and we check the return value.
+                let res = unsafe {
+                    libc::setxattr(
+                        path.as_ptr(),
+                        cap_name.as_ptr(),
+                        b"cap".as_ptr().cast(),
+                        3,
+                        0,
+                    )
+                };
+                assert_eq!(res, 0, "setxattr: {}", io::Error::last_os_error());
+                std::fs::set_permissions(root.join("caps"), PermissionsExt::from_mode(0o400))
+                    .unwrap();
+                let inode = fs
+                    .lookup(ctx(), fuse::ROOT_ID, &cstr("caps"))
+                    .unwrap()
+                    .inode;
+                setacl(inode, &named_acl(4, 4)).unwrap();
+                assert_eq!(
+                    host_xattr("caps", "user.virtiofs.security.capability"),
+                    None
+                );
+                assert_eq!(host_mode("caps"), 0o440);
+            }
+
+            std::fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     /// Exercises `posix_acl_create_fallback` end to end on the host filesystem holding the
